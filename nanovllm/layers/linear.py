@@ -219,7 +219,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 y = y_masked + rw.view(*view_shape)
 
         # 可视化与正确性对比（仅打印一次）
-        from nanovllm.utils.trace import layer_enabled, get_trace_config
+        from nanovllm.utils.trace import layer_enabled, get_trace_config, gpu_sample_line
         if layer_enabled(self.layer_id) and should_trace(f"QKVParallelLinear:{id(self)}"):
             cfg = get_trace_config()
             print_line(f"[TRACE][QKV][L{self.layer_id}] 线性加密流程")
@@ -251,6 +251,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     pass_run = run_rel <= 1e-1
                     print_line(f"[QKV][alg] PASS={pass_alg} abs={alg_abs_err:.2e} rel={alg_rel:.2e}")
                     print_line(f"[QKV][run] PASS={pass_run} abs={run_abs_err:.2e} rel={run_rel:.2e}")
+                    # 展示 GPU 所做的计算产物（小样本）
+                    if cfg.show_gpu_calc:
+                        gpu_sample_line("[QKV][gpu] y' sample", y_masked)
                 else:
                     print_line(f"x: {tuple(x.shape)} -> x' {tuple(x_masked.shape)} | W {tuple(self.weight.shape)} | y' {tuple(y_masked.shape)} -> y {tuple(y.shape)}")
                     print_line(f"r: {tuple(r_cpu.shape)} | rW: {tuple(rw_cpu.shape)} (CPU)")

@@ -13,6 +13,9 @@ class TraceConfig:
     layer_filter: int | None = 0
     # 只输出指标（PASS/FAIL + 误差），不打印张量形状与样例
     summary_only: bool = True
+    # 是否额外展示 GPU 上即时计算的小样本数值（只打印一行）
+    show_gpu_calc: bool = True
+    gpu_items: int = 3
 
 
 _TRACE_CONFIG = TraceConfig()
@@ -62,6 +65,16 @@ def print_tensor(name: str, t: torch.Tensor):
 
 def print_line(msg: str):
     print(msg)
+
+
+def gpu_sample_line(prefix: str, t: torch.Tensor):
+    try:
+        dev = t.device
+        # 取前若干项到 CPU 仅用于显示
+        vals = _flatten_head(t, _TRACE_CONFIG.gpu_items)
+        print_line(f"{prefix} dev={dev} vals={vals}")
+    except Exception as e:
+        print_line(f"{prefix} <gpu sample failed: {e}>")
 
 
 def layer_enabled(layer_id: int | None) -> bool:

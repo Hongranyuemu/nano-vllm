@@ -122,7 +122,7 @@ class Qwen3Attention(nn.Module):
         o = self.attn(q_encrypted, k_encrypted, v)
 
         # 可视化与分数不变性验证（仅打印一次，且只在 layer_filter 命中时打印）
-        from nanovllm.utils.trace import layer_enabled, get_trace_config
+        from nanovllm.utils.trace import layer_enabled, get_trace_config, gpu_sample_line
         if layer_enabled(self.layer_id) and should_trace(f"Qwen3Attention:{id(self)}") and get_security_config().enable_softmax_encrypt:
             cfg = get_trace_config()
             print_line(f"[TRACE][QK][L{self.layer_id}] 正交加密与分数不变性")
@@ -152,6 +152,15 @@ class Qwen3Attention(nn.Module):
                         pass_rms = rms_rel <= 1e-6
                         print_line(f"[QK][score] PASS={pass_score} abs={abs_err:.2e} rel={rel_err:.2e}")
                         print_line(f"[QK][rms]   PASS={pass_rms} rel={rms_rel:.2e}")
+                        if cfg.show_gpu_calc:
+                            # 从 GPU 取一小块分数示例（以第 0 个位置的头为例）
+                            try:
+                                # q_encrypted/k_encrypted 在 GPU；取第 0 个 token 的打分一行
+                                if q_encrypted.size(0) > 0:
+                                    s_gpu = torch.matmul(q_encrypted[0], k_encrypted[0].transpose(-1, -2))
+                                    gpu_sample_line("[QK][gpu] score row0 sample", s_gpu[0])
+                            except Exception as _:
+                                pass
                     else:
                         print_line(f"R {tuple(R0.shape)} | q/k {tuple(qh.shape)} | o {tuple(o.shape)}")
                         print_line(f"score abs={abs_err:.2e} rel={rel_err:.2e} | rms_rel={rms_rel:.2e}")
