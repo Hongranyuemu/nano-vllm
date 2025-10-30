@@ -3,7 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from nanovllm.utils.secure import NoisePool, get_security_config
-from nanovllm.utils.trace import should_trace, print_tensor, print_line
 
 
 def divide(numerator, denominator):
@@ -216,49 +215,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (y_masked.dim() - 1) + [rw.shape[0]]
                 y = y_masked + rw.view(*view_shape)
-
-        # 可视化与正确性对比（仅打印一次）
-        from nanovllm.utils.trace import layer_enabled, get_trace_config, gpu_sample_line
-        if layer_enabled(self.layer_id) and should_trace(f"QKVParallelLinear:{id(self)}"):
-            cfg = get_trace_config()
-            print_line(f"[TRACE][QKV][L{self.layer_id}] 线性加密流程")
-            try:
-                # 参考对比（纯 CPU-fp32 代数等价 + 运行路径）
-                w_cpu = self.weight.detach().to(device="cpu", dtype=torch.float32)
-                b_cpu = None if self.bias is None else self.bias.detach().to(device="cpu", dtype=torch.float32)
-                x_plain_cpu = x.detach().to(device="cpu", dtype=torch.float32)
-                y_ref_cpu = F.linear(x_plain_cpu, w_cpu, b_cpu)
-                if x_plain_cpu.dim() == 2:
-                    r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).unsqueeze(0)
-                else:
-                    view_shape = [1] * (x_plain_cpu.dim() - 1) + [r_cpu.numel()]
-                    r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).view(*view_shape)
-                y_rec_cpu_true = F.linear(x_plain_cpu - r_b_cpu, w_cpu, b_cpu) + rw_cpu.to(dtype=torch.float32).unsqueeze(0)
-                alg_abs_err = (y_ref_cpu - y_rec_cpu_true).abs().max().item()
-                y_rec_cpu = y.detach().to(device="cpu", dtype=torch.float32)
-                run_abs_err = (y_ref_cpu - y_rec_cpu).abs().max().item()
-
-                # 同时给出相对误差，便于不同尺度比较
-                denom = y_ref_cpu.abs().max().item() + 1e-6
-                alg_rel = alg_abs_err / denom
-                run_rel = run_abs_err / denom
-
-                # 简洁输出
-                if cfg.summary_only:
-                    # 阈值策略：代数等价应近似 0；运行路径相对误差在 bf16 下放宽到 1e-1
-                    pass_alg = alg_abs_err <= 1e-6 or alg_rel <= 1e-6
-                    pass_run = run_rel <= 1e-1
-                    print_line(f"[QKV][alg] PASS={pass_alg} abs={alg_abs_err:.2e} rel={alg_rel:.2e}")
-                    print_line(f"[QKV][run] PASS={pass_run} abs={run_abs_err:.2e} rel={run_rel:.2e}")
-                    # 展示 GPU 所做的计算产物（小样本）
-                    if cfg.show_gpu_calc:
-                        gpu_sample_line("[QKV][gpu] y' sample", y_masked)
-                else:
-                    print_line(f"x: {tuple(x.shape)} -> x' {tuple(x_masked.shape)} | W {tuple(self.weight.shape)} | y' {tuple(y_masked.shape)} -> y {tuple(y.shape)}")
-                    print_line(f"r: {tuple(r_cpu.shape)} | rW: {tuple(rw_cpu.shape)} (CPU)")
-                    print_line(f"equiv_err(alg) abs={alg_abs_err:.2e} rel={alg_rel:.2e} | equiv_err(run) abs={run_abs_err:.2e} rel={run_rel:.2e}")
-            except Exception as e:
-                print_line(f"trace 对比失败: {e}")
 
         return y
     
