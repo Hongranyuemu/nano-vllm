@@ -8,8 +8,8 @@ import torch
 
 @dataclass
 class SecurityConfig:
-    enable_softmax_encrypt: bool = False
-    enable_linear_noise: bool = False
+    enable_softmax_encrypt: bool = True
+    enable_linear_noise: bool = True
     encrypt_on_cpu: bool = True
     decrypt_on_cpu: bool = True
     noise_pool_size: int = 16
@@ -43,11 +43,10 @@ def orthogonal_matrix(dim: int, dtype: torch.dtype, device: torch.device, seed: 
     使用 QR 分解保证数值稳定，R 取 Q。
     """
     g = _manual_seed(_CONFIG.seed if seed is None else seed)
-    # 注意：在模型构建阶段 global default device 可能被设为 cuda
-    # 这里显式在 CPU 上采样，避免与 CPU generator 不匹配
+    # 生成随机矩阵并进行 QR 分解，使用cpu进行采样
     a = torch.randn((dim, dim), dtype=torch.float32, device="cpu", generator=g)
     q, r = torch.linalg.qr(a)
-    # 提升到目标 dtype/device
+
     q = q.to(dtype=dtype, device=device)
     return q
 
@@ -67,8 +66,7 @@ class NoisePool:
         self.seed = seed
         self._rng = _manual_seed(seed)
 
-        # r_pool: [P, in_features] 存在 CPU 上，避免与 GPU 权重生命周期耦合
-        # 显式在 CPU 上采样，避免 default device=CUDA 时与 CPU generator 冲突
+        # r_pool: [P, in_features] 存在 CPU 上
         self.r_pool_cpu = torch.randn((pool_size, in_features), device="cpu", generator=self._rng) * noise_scale
         self.r_pool_cpu = self.r_pool_cpu.to(dtype=torch.float32, device="cpu")
 
@@ -94,7 +92,6 @@ class NoisePool:
         """
         assert self.rw_pool_cpu is not None, "NoisePool: rW 尚未预计算，请在权重加载后调用 set_weight()。"
         if index is None:
-            # 显式在 CPU 上采样索引，避免默认设备为 CUDA 时与 CPU generator 冲突
             idx = int(torch.randint(0, self.pool_size, (1,), device="cpu", generator=self._rng).item())
         else:
             idx = int(index)

@@ -10,7 +10,6 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.secure import get_security_config, orthogonal_matrix
-from nanovllm.utils.trace import should_trace, print_tensor, print_line
 
 
 class Qwen3Attention(nn.Module):
@@ -27,7 +26,6 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
 
-        #新增参数
         enable_vector_mask: bool = True,    # 是否启用向量掩码
         mask_scale: float = 0.05, 
         layer_id: int = 0,
@@ -46,14 +44,14 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.layer_id = layer_id
 
-        # 软最大（QK^T）加密：使用正交矩阵 R，满足 R^{-1} = R^T，使 Q->Q R^T, K->K R^T，不改变 QK^T
+        # QK^T加密：使用正交矩阵 R，满足 R^{-1} = R^T
         sec = get_security_config()
         if sec.enable_softmax_encrypt:
             # 使用 float32 存储 R，保持正交性，避免 bf16 破坏 R R^T ≈ I
             R = orthogonal_matrix(self.head_dim, dtype=torch.float32, device=torch.device('cpu'))
         else:
             R = torch.eye(self.head_dim, dtype=torch.float32, device='cpu')
-        # 单一 R 即可：Q' = Q R, K' = K R，保证 Q'K'^T = QK^T
+
         self.encrypt_R = nn.Parameter(R, requires_grad=False)
 
         # 从安全配置读取线性噪声开关与强度
@@ -103,7 +101,7 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        # 应用正交加密（TEE on CPU -> 先回到 CPU 再加密并发送给 GPU）
+        # 应用正交加密
         from nanovllm.utils.secure import get_security_config
         sec = get_security_config()
         if sec.enable_softmax_encrypt and sec.encrypt_on_cpu:
@@ -120,56 +118,9 @@ class Qwen3Attention(nn.Module):
             k_encrypted = torch.matmul(k, R)
 
         o = self.attn(q_encrypted, k_encrypted, v)
-
-        # 可视化与分数不变性验证（仅打印一次，且只在 layer_filter 命中时打印）
-        from nanovllm.utils.trace import layer_enabled, get_trace_config, gpu_sample_line
-        if layer_enabled(self.layer_id) and should_trace(f"Qwen3Attention:{id(self)}") and get_security_config().enable_softmax_encrypt:
-            cfg = get_trace_config()
-            print_line(f"[TRACE][QK][L{self.layer_id}] 正交加密与分数不变性")
-            try:
-                # 取一个样本做对比（在 CPU 上计算参考分数）
-                q0 = q.detach().to(device="cpu", dtype=torch.float32)
-                k0 = k.detach().to(device="cpu", dtype=torch.float32)
-                R0 = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
-                if q0.dim() == 3 and k0.dim() == 3:
-                    qh = q0[0]  # [num_heads, head_dim]
-                    kh = k0[0]
-                    s_ref = torch.matmul(qh, kh.transpose(-1, -2))
-                    s_enc = torch.matmul(qh @ R0, (kh @ R0).transpose(-1, -2))
-                    abs_err = (s_ref - s_enc).abs().max().item()
-                    denom = s_ref.abs().max().item() + 1e-6
-                    rel_err = abs_err / denom
-
-                    # RMS 不变性（取一个向量）
-                    x = q0[0, 0]
-                    xr = (q0[0, 0] @ R0)
-                    rms = torch.sqrt((x.pow(2)).mean()).item()
-                    rms_r = torch.sqrt((xr.pow(2)).mean()).item()
-                    rms_rel = abs(rms_r - rms) / (abs(rms) + 1e-6)
-
-                    if cfg.summary_only:
-                        pass_score = abs_err <= 1e-5 or rel_err <= 1e-6
-                        pass_rms = rms_rel <= 1e-6
-                        print_line(f"[QK][score] PASS={pass_score} abs={abs_err:.2e} rel={rel_err:.2e}")
-                        print_line(f"[QK][rms]   PASS={pass_rms} rel={rms_rel:.2e}")
-                        if cfg.show_gpu_calc:
-                            # 从 GPU 取一小块分数示例（以第 0 个位置的头为例）
-                            try:
-                                # q_encrypted/k_encrypted 在 GPU；取第 0 个 token 的打分一行
-                                if q_encrypted.size(0) > 0:
-                                    s_gpu = torch.matmul(q_encrypted[0], k_encrypted[0].transpose(-1, -2))
-                                    gpu_sample_line("[QK][gpu] score row0 sample", s_gpu[0])
-                            except Exception as _:
-                                pass
-                    else:
-                        print_line(f"R {tuple(R0.shape)} | q/k {tuple(qh.shape)} | o {tuple(o.shape)}")
-                        print_line(f"score abs={abs_err:.2e} rel={rel_err:.2e} | rms_rel={rms_rel:.2e}")
-            except Exception as e:
-                print_line(f"分数不变性验证失败: {e}")
         output = self.o_proj(o.flatten(1, -1))
         return output
 
-#mlp部分也需要进行线性噪声加密吗
 class Qwen3MLP(nn.Module):
 
     def __init__(

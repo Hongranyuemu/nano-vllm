@@ -128,11 +128,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.hidden_size = hidden_size
         self.layer_id = layer_id
 
-        # 安全配置：是否在 CPU 上执行解密补偿
         sec = get_security_config()
         self.decrypt_on_cpu = sec.decrypt_on_cpu
         pool_size = sec.noise_pool_size
-        # 噪声池（输入维度 hidden_size，输出维度为本 rank 的 out_features）
+        # 噪声池（输入维度：hidden_size，输出维度：本层的 out_features）
         if self.enable_mask:
             self._noise_pool = NoisePool(
                 in_features=hidden_size,
@@ -161,7 +160,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
         # 权重更新后，更新噪声池的 rW 预计算
         if self._noise_pool is not None and param is self.weight:
-            # 注意：这里每次装载一段权重后都会更新一次 rW，待全部装载完成后会稳定。
+            # 每次装载一段权重后更新一次 rW，待全部装载完成后会稳定。
             self._noise_pool.set_weight(self.weight.data)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
