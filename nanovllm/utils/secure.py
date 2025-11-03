@@ -12,6 +12,7 @@ class SecurityConfig:
     enable_linear_noise: bool = True
     encrypt_on_cpu: bool = True
     decrypt_on_cpu: bool = True
+    tee_strict_mode: bool = False
     noise_pool_size: int = 16
     noise_scale: float = 0.05
     seed: int = 1234

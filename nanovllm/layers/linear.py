@@ -206,7 +206,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
                 y_cpu = y_cpu + rw.view(*view_shape)
-            y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
+            # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
+            if get_security_config().tee_strict_mode and sec.encrypt_on_cpu:
+                y = y_cpu.to(dtype=y_masked.dtype)
+            else:
+                y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)

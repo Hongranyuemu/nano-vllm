@@ -87,12 +87,18 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
+        # 严格TEE：除QKV线性与注意力核外，其余尽量在CPU上执行
+        if get_security_config().tee_strict_mode:
+            self.q_norm.to("cpu")
+            self.k_norm.to("cpu")
+            self.o_proj.to("cpu")
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        #形成QKV矩阵
+        # 形成 QKV 矩阵（QKV 线性在GPU，解密后可根据配置保留在CPU）
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
@@ -101,25 +107,30 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        # 应用正交加密
+        # 应用正交加密（仅将加密后的 q/k 与 v 送到 GPU 做注意力）
         from nanovllm.utils.secure import get_security_config
         sec = get_security_config()
         if sec.enable_softmax_encrypt and sec.encrypt_on_cpu:
             R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
-            q_cpu = q.detach().to(device="cpu", dtype=torch.float32)
-            k_cpu = k.detach().to(device="cpu", dtype=torch.float32)
-            q_enc_cpu = torch.matmul(q_cpu, R_cpu)
-            k_enc_cpu = torch.matmul(k_cpu, R_cpu)
-            q_encrypted = q_enc_cpu.to(device=q.device, dtype=q.dtype)
-            k_encrypted = k_enc_cpu.to(device=k.device, dtype=k.dtype)
+            q = torch.matmul(q.detach().to(device="cpu", dtype=torch.float32), R_cpu)
+            k = torch.matmul(k.detach().to(device="cpu", dtype=torch.float32), R_cpu)
         else:
             R = self.encrypt_R.to(device=q.device, dtype=q.dtype)
-            q_encrypted = torch.matmul(q, R)
-            k_encrypted = torch.matmul(k, R)
+            q = torch.matmul(q, R)
+            k = torch.matmul(k, R)
 
-        o = self.attn(q_encrypted, k_encrypted, v)
-        output = self.o_proj(o.flatten(1, -1))
-        return output
+        if sec.tee_strict_mode:
+            q_gpu = q.to(device="cuda", dtype=q.dtype)
+            k_gpu = k.to(device="cuda", dtype=k.dtype)
+            v_gpu = v.to(device="cuda", dtype=v.dtype)
+            o = self.attn(q_gpu, k_gpu, v_gpu)
+            o_cpu = o.to(device="cpu", dtype=o.dtype)
+            output = self.o_proj(o_cpu.flatten(1, -1))
+            return output
+        else:
+            o = self.attn(q, k, v)
+            output = self.o_proj(o.flatten(1, -1))
+            return output
 
 class Qwen3MLP(nn.Module):
 
@@ -178,6 +189,13 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # 严格TEE：其余计算尽量在CPU
+        from nanovllm.utils.secure import get_security_config
+        if get_security_config().tee_strict_mode:
+            self.input_layernorm.to("cpu")
+            self.post_attention_layernorm.to("cpu")
+            self.mlp.to("cpu")
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -204,6 +222,11 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config, layer_id=i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        from nanovllm.utils.secure import get_security_config
+        if get_security_config().tee_strict_mode:
+            self.embed_tokens.to("cpu")
+            self.norm.to("cpu")
 
     def forward(
         self,
@@ -236,6 +259,9 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+        from nanovllm.utils.secure import get_security_config
+        if get_security_config().tee_strict_mode:
+            self.lm_head.to("cpu")
 
     def forward(
         self,
