@@ -92,6 +92,7 @@ class Qwen3Attention(nn.Module):
             self.q_norm.to("cpu")
             self.k_norm.to("cpu")
             self.o_proj.to("cpu")
+            self.rotary_emb.to("cpu")
 
     def forward(
         self,
@@ -108,7 +109,6 @@ class Qwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         # 应用正交加密（仅将加密后的 q/k 与 v 送到 GPU 做注意力）
-        from nanovllm.utils.secure import get_security_config
         sec = get_security_config()
         if sec.enable_softmax_encrypt and sec.encrypt_on_cpu:
             R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
@@ -127,9 +127,11 @@ class Qwen3Attention(nn.Module):
             k = k.to(device=target_dev, dtype=target_dtype)
 
         if sec.tee_strict_mode:
-            q_gpu = q.to(device="cuda", dtype=q.dtype)
-            k_gpu = k.to(device="cuda", dtype=k.dtype)
-            v_gpu = v.to(device="cuda", dtype=v.dtype)
+            #加密后的qkv矩阵为float32，送到GPU做注意力计算，但是FlashAttention需要bf16或fp16
+            target_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+            q_gpu = q.to(device="cuda", dtype=target_dtype)
+            k_gpu = k.to(device="cuda", dtype=target_dtype)
+            v_gpu = v.to(device="cuda", dtype=target_dtype)
             o = self.attn(q_gpu, k_gpu, v_gpu)
             o_cpu = o.to(device="cpu", dtype=o.dtype)
             output = self.o_proj(o_cpu.flatten(1, -1))
@@ -196,8 +198,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # 严格TEE：其余计算尽量在CPU
-        from nanovllm.utils.secure import get_security_config
+        # 在CPU上执行
         if get_security_config().tee_strict_mode:
             self.input_layernorm.to("cpu")
             self.post_attention_layernorm.to("cpu")
@@ -232,7 +233,6 @@ class Qwen3Model(nn.Module):
 
         from nanovllm.utils.secure import get_security_config
         if get_security_config().tee_strict_mode:
-            self.embed_tokens.to("cpu")
             self.norm.to("cpu")
 
     def forward(
@@ -240,7 +240,13 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        
+        sec = get_security_config()
         hidden_states = self.embed_tokens(input_ids)
+
+        if sec.tee_strict_mode:
+            hidden_states = hidden_states.to("cpu")
+            positions = positions.to("cpu")
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)

@@ -56,7 +56,8 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
+            # 保障索引与被索引张量在同一设备（严格TEE下x在CPU，而cu_seqlens_q在CUDA）
+            last_indices = (context.cu_seqlens_q[1:] - 1).to(device=x.device)
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:

@@ -1,10 +1,11 @@
 import os
+import time
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 from nanovllm.utils.secure import set_security_config
 
-
 def main():
+    t0 = time.perf_counter()
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
     # 启用加密方案：CPU 作为 TEE，GPU 作为不可信加速器
@@ -12,7 +13,8 @@ def main():
         enable_softmax_encrypt=True,   # Q/K 正交加密（softmax 不变）
         enable_linear_noise=True,      # QKV 线性层输入侧加噪 + rW 预计算
         encrypt_on_cpu=True,           # 在 CPU(TEE) 执行加密
-        decrypt_on_cpu=True,           # 在 CPU(TEE) 执行解密补偿（更贴合 TEE）
+        decrypt_on_cpu=True,           # 在 CPU(TEE) 执行解密
+        tee_strict_mode=True,          # 严格 TEE 模式，尽量在 CPU 上执行非加密计算
         noise_pool_size=16,
         noise_scale=0.05,
         seed=1234,
@@ -38,6 +40,9 @@ def main():
         print("\n")
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
+
+    t1 = time.perf_counter()
+    print(f"\nTotal time: {t1 - t0:.3f} seconds")
 
 
 if __name__ == "__main__":
