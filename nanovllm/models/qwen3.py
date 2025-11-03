@@ -119,6 +119,13 @@ class Qwen3Attention(nn.Module):
             q = torch.matmul(q, R)
             k = torch.matmul(k, R)
 
+        # 非严格TEE模式下，如果在CPU上完成了q/k加密，则需要将q/k移回GPU以便FlashAttention使用
+        if (not sec.tee_strict_mode) and sec.enable_softmax_encrypt and sec.encrypt_on_cpu:
+            target_dev = v.device
+            target_dtype = v.dtype
+            q = q.to(device=target_dev, dtype=target_dtype)
+            k = k.to(device=target_dev, dtype=target_dtype)
+
         if sec.tee_strict_mode:
             q_gpu = q.to(device="cuda", dtype=q.dtype)
             k_gpu = k.to(device="cuda", dtype=k.dtype)
