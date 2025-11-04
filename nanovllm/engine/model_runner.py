@@ -26,7 +26,13 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        # 兼容 Transformers 版本：优先使用 hf_config.dtype，其次回退到 hf_config.torch_dtype
+        runtime_dtype = getattr(hf_config, "dtype", None)
+        if runtime_dtype is None:
+            runtime_dtype = getattr(hf_config, "torch_dtype", None)
+        if runtime_dtype is None:
+            runtime_dtype = default_dtype
+        torch.set_default_dtype(runtime_dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
@@ -102,8 +108,13 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        # 单个 KV block 的显存占用（K 和 V 各一份）
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        # 单个 KV block 的显存占用（K 和 V 各一份）。
+        # 兼容 dtype 字段差异，使用 PyTorch 计算单元素字节数
+        dtype_for_bytes = getattr(hf_config, "dtype", None)
+        if dtype_for_bytes is None:
+            dtype_for_bytes = getattr(hf_config, "torch_dtype", torch.float16)
+        dtype_bytes = torch.tensor(0, dtype=dtype_for_bytes).element_size()
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * dtype_bytes
         # 更稳健的可用显存估计：按空闲显存的比例使用，避免引入峰值统计导致负数
         available = int(free * config.gpu_memory_utilization)
         # 至少分配 1 个 block，避免由于估计偏差导致断言失败
