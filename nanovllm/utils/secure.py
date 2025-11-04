@@ -56,7 +56,12 @@ class NoisePool:
     """
     噪声池：提供固定数量的输入侧噪声向量 r（形状 [in_features]），
     并在权重确定后预计算补偿项 rW（形状 [out_features]）。
-    在前向中：x' = x - r，GPU 计算 y' = x' W^T + b，CPU 端（或 GPU）加回 rW 以恢复 y。
+    在前向中使用“加性线性噪声加密”：
+      - 从噪声池中随机选取两个向量 r1、r2；
+      - 采样两个随机缩放系数 alpha、beta，形成组合噪声 r = alpha*r1 + beta*r2；
+      - 在线性输出侧添加对应补偿 rW = alpha*(r1 W^T) + beta*(r2 W^T)。
+    同时对被选取的两个向量执行“保持分量的旋转混合”以生成新的两个向量，回填到噪声池中，
+    并更新其对应的 rW。
     """
 
     def __init__(self, in_features: int, out_features: int, pool_size: int, noise_scale: float, seed: int = 1234):
@@ -73,6 +78,8 @@ class NoisePool:
 
         # rW_pool: [P, out_features]，在 set_weight 之后计算
         self.rw_pool_cpu: Optional[torch.Tensor] = None
+        # 保存权重，便于在旋转更新后仅更新对应行的 rW
+        self._w_cpu: Optional[torch.Tensor] = None
 
     def set_weight(self, weight_shard: torch.Tensor):
         """
@@ -85,17 +92,70 @@ class NoisePool:
         assert out_features == self.out_features and in_features == self.in_features
         # 使用 CPU 计算，符合“CPU 可用于解密/补偿”的需求
         w_cpu = weight_shard.detach().to(dtype=torch.float32, device="cpu")
+        self._w_cpu = w_cpu
         self.rw_pool_cpu = self.r_pool_cpu @ w_cpu.T
+    def _rotate_and_update(self, idx1: int, idx2: int):
+        """
+        对 r_pool[idx1], r_pool[idx2] 执行保持分量的旋转混合：
+          [r1'; r2'] = [cos -sin; sin cos] @ [r1; r2]
+        然后更新 r_pool 与对应的 rW 行。
+        """
+        # 随机角度 θ ∈ [0, 2π)
+        theta = torch.rand((), device="cpu", generator=self._rng).item() * 2.0 * math.pi
+        c = math.cos(theta)
+        s = math.sin(theta)
 
-    def sample(self, index: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor, int]:
+        r1 = self.r_pool_cpu[idx1]
+        r2 = self.r_pool_cpu[idx2]
+        # 逐分量旋转（共享一个 θ）
+        r1_new = c * r1 - s * r2
+        r2_new = s * r1 + c * r2
+
+        self.r_pool_cpu[idx1] = r1_new
+        self.r_pool_cpu[idx2] = r2_new
+
+        if self._w_cpu is not None:
+            # 仅更新两行 rW
+            self.rw_pool_cpu[idx1] = r1_new @ self._w_cpu.T
+            self.rw_pool_cpu[idx2] = r2_new @ self._w_cpu.T
+
+    def sample(self, index: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
         """
-        采样一个噪声 r 及其补偿 rW（均在 CPU 上），返回 (r_cpu, rW_cpu, idx)。
+        采样两个噪声向量并进行线性组合：
+          r = alpha * r1 + beta * r2
+          rW = alpha * rW1 + beta * rW2
+        返回 (r_cpu, rW_cpu, (idx1, idx2))，并将 (r1, r2) 经过旋转混合后写回池中。
         """
-        assert self.rw_pool_cpu is not None, "NoisePool: rW 尚未预计算，请在权重加载后调用 set_weight()。"
+        assert self.rw_pool_cpu is not None and self._w_cpu is not None, (
+            "NoisePool: rW 尚未预计算，请在权重加载后调用 set_weight()。"
+        )
+
         if index is None:
-            idx = int(torch.randint(0, self.pool_size, (1,), device="cpu", generator=self._rng).item())
+            # 采样两个不相同的索引
+            idx1 = int(torch.randint(0, self.pool_size, (1,), device="cpu", generator=self._rng).item())
+            idx2 = int(torch.randint(0, self.pool_size - 1, (1,), device="cpu", generator=self._rng).item())
+            if idx2 >= idx1:
+                idx2 += 1
         else:
-            idx = int(index)
-        r_cpu = self.r_pool_cpu[idx]
-        rw_cpu = self.rw_pool_cpu[idx]
-        return r_cpu, rw_cpu, idx
+            # 当外部指定一个 index 时，第二个索引仍然随机选取且不等于 index
+            idx1 = int(index)
+            idx2 = int(torch.randint(0, self.pool_size - 1, (1,), device="cpu", generator=self._rng).item())
+            if idx2 >= idx1:
+                idx2 += 1
+
+        r1 = self.r_pool_cpu[idx1]
+        r2 = self.r_pool_cpu[idx2]
+        rw1 = self.rw_pool_cpu[idx1]
+        rw2 = self.rw_pool_cpu[idx2]
+
+        # 随机缩放系数 alpha, beta（均匀分布于 [0, 1)）
+        alpha = torch.rand((), device="cpu", generator=self._rng).to(dtype=torch.float32)
+        beta = torch.rand((), device="cpu", generator=self._rng).to(dtype=torch.float32)
+
+        r = alpha * r1 + beta * r2
+        rw = alpha * rw1 + beta * rw2
+
+        # 使用旋转混合生成两个新向量并回填池中
+        self._rotate_and_update(idx1, idx2)
+
+        return r, rw, (idx1, idx2)
