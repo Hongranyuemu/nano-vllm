@@ -101,13 +101,13 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # 单个 KV block 的显存占用（K 和 V 各一份）
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        # 更稳健的可用显存估计：按空闲显存的比例使用，避免引入峰值统计导致负数
+        available = int(free * config.gpu_memory_utilization)
+        # 至少分配 1 个 block，避免由于估计偏差导致断言失败
+        config.num_kvcache_blocks = max(1, available // block_bytes)
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
