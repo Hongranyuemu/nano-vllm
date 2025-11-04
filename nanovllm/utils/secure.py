@@ -90,7 +90,7 @@ class NoisePool:
         assert weight_shard.dim() == 2
         out_features, in_features = weight_shard.shape
         assert out_features == self.out_features and in_features == self.in_features
-        # 使用 CPU 计算，符合“CPU 可用于解密/补偿”的需求
+        # 使用 CPU 计算补偿
         w_cpu = weight_shard.detach().to(dtype=torch.float32, device="cpu")
         self._w_cpu = w_cpu
         self.rw_pool_cpu = self.r_pool_cpu @ w_cpu.T

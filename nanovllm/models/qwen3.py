@@ -127,13 +127,15 @@ class Qwen3Attention(nn.Module):
             k = k.to(device=target_dev, dtype=target_dtype)
 
         if sec.tee_strict_mode:
-            #加密后的qkv矩阵为float32，送到GPU做注意力计算，但是FlashAttention需要bf16或fp16
+            # 加密后的 q/k/v 先转到 GPU；FlashAttention 需要 bf16/fp16。
             target_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
             q_gpu = q.to(device="cuda", dtype=target_dtype)
             k_gpu = k.to(device="cuda", dtype=target_dtype)
             v_gpu = v.to(device="cuda", dtype=target_dtype)
-            o = self.attn(q_gpu, k_gpu, v_gpu)
-            o_cpu = o.to(device="cpu", dtype=o.dtype)
+            # 在 GPU 上计算注意力（包含 s = softmax(QK^T) 和 s @ V）
+            o_gpu = self.attn(q_gpu, k_gpu, v_gpu)
+            # 将注意力输出带回 CPU，后续输出投影在 CPU 进行
+            o_cpu = o_gpu.to(device="cpu", dtype=o_gpu.dtype)
             output = self.o_proj(o_cpu.flatten(1, -1))
             return output
         else:

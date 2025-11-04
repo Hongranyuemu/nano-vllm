@@ -162,6 +162,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             # 每次装载一段权重后更新一次 rW，待全部装载完成后会稳定。
             self._noise_pool.set_weight(self.weight.data)
 
+    #前向传播时，先对输入x进行加密处理，然后再进行线性变换，最后解密输出
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 如果未启用掩码，直接返回原始计算
         if not self.enable_mask or self._noise_pool is None:
@@ -196,7 +197,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         # 在 GPU 上计算加密后的线性：y' = (x - r) W^T + b
         y_masked = F.linear(x_masked, self.weight, self.bias)
 
-        # 解密补偿：添加 rW
+        # 解密：添加 rW
         if sec.decrypt_on_cpu:
             # 将 y' 回传到 CPU，在 CPU 上做补偿，再返回设备
             y_cpu = y_masked.detach().to(device="cpu", dtype=torch.float32)
