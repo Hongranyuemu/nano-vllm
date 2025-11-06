@@ -9,9 +9,7 @@ def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
 
-#实现并行线性层，在分布式环境中高效处理大规模模型的线性变换
-#可以生成注意力机制中的QKV矩阵
-#在MLP中进行前向传播
+
 class LinearBase(nn.Module):
 
     def __init__(
@@ -53,7 +51,7 @@ class ReplicatedLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
 
-
+#按列并行划分的线性层
 class ColumnParallelLinear(LinearBase):
 
     def __init__(
@@ -95,7 +93,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
-#继承这个类，增加一步对x进行加密的操作
+
 class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
@@ -164,15 +162,21 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     #前向传播时，先对输入x进行加密处理，然后再进行线性变换，最后解密输出
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 如果未启用掩码，直接返回原始计算
+        # 安全配置
+        sec = get_security_config()
+        # 未启用掩码/噪声：仍需保证设备一致，并在严格TEE下将输出移回CPU
         if not self.enable_mask or self._noise_pool is None:
-            return F.linear(x, self.weight, self.bias)
+            if x.device != self.weight.device:
+                x = x.to(self.weight.device)
+            y = F.linear(x, self.weight, self.bias)
+            if sec.tee_strict_mode:
+                y = y.to(device="cpu", dtype=y.dtype)
+            return y
 
         # 采样噪声 r 及补偿 rW（均为 CPU 张量，形状：[in_features], [out_features]）
         r_cpu, rw_cpu, _ = self._noise_pool.sample()
 
         # 在 CPU 进行加密（TEE）：x' = x - r
-        sec = get_security_config()
         if sec.encrypt_on_cpu:
             x_cpu = x.detach().to(device="cpu", dtype=torch.float32)
             r = r_cpu.to(dtype=x_cpu.dtype)
@@ -208,10 +212,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
                 y_cpu = y_cpu + rw.view(*view_shape)
             # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
-            if get_security_config().tee_strict_mode and sec.encrypt_on_cpu:
-                y = y_cpu.to(dtype=y_masked.dtype)
-            else:
-                y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
+            y = y_cpu.to(dtype=y_masked.dtype) if sec.tee_strict_mode and sec.encrypt_on_cpu else y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
@@ -221,8 +222,13 @@ class QKVParallelLinear(ColumnParallelLinear):
                 view_shape = [1] * (y_masked.dim() - 1) + [rw.shape[0]]
                 y = y_masked + rw.view(*view_shape)
 
+        # 严格TEE下，保证QKV线性后的输出在CPU，便于后续CPU模块（RMSNorm/Rotary等）
+        if sec.tee_strict_mode:
+            y = y.to(device="cpu", dtype=y.dtype)
+
         return y
-    
+
+#按行并行划分的线性层
 class RowParallelLinear(LinearBase):
 
     def __init__(

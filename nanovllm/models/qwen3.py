@@ -26,8 +26,6 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
 
-        enable_vector_mask: bool = True,    # 是否启用向量掩码
-        mask_scale: float = 0.05, 
         layer_id: int = 0,
     ) -> None:
         super().__init__()
@@ -200,7 +198,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # 在CPU上执行
+        # 使layernorm和mlp在CPU上执行
         if get_security_config().tee_strict_mode:
             self.input_layernorm.to("cpu")
             self.post_attention_layernorm.to("cpu")
