@@ -103,7 +103,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
-        enable_mask: bool = True,      # 是否启用加性噪声掩码（x -> x - r）
+        enable_mask: bool = True,      # 是否启用加性噪声掩码（x -> x + r）
         mask_scale: float = 0.05,      # 噪声强度
         layer_id: int | None = None,
     ):
@@ -176,7 +176,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         # 采样噪声 r 及补偿 rW（均为 CPU 张量，形状：[in_features], [out_features]）
         r_cpu, rw_cpu, _ = self._noise_pool.sample()
 
-        # 在 CPU 进行加密（TEE）：x' = x - r
+        # 在 CPU 进行加密（TEE）：x' = x + r
         if sec.encrypt_on_cpu:
             x_cpu = x.detach().to(device="cpu", dtype=torch.float32)
             r = r_cpu.to(dtype=x_cpu.dtype)
@@ -185,7 +185,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (x_cpu.dim() - 1) + [r.shape[0]]
                 r_b = r.view(*view_shape)
-            x_masked_cpu = x_cpu - r_b
+            x_masked_cpu = x_cpu + r_b
             # 传送给不安全 GPU 做线性
             x_masked = x_masked_cpu.to(device=self.weight.device, dtype=x.dtype)
         else:
@@ -196,31 +196,31 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (x.dim() - 1) + [r.shape[0]]
                 r_b = r.view(*view_shape)
-            x_masked = x - r_b
+            x_masked = x + r_b
 
-        # 在 GPU 上计算加密后的线性：y' = (x - r) W^T + b
+        # 在 GPU 上计算加密后的线性：y' = (x + r) W^T + b
         y_masked = F.linear(x_masked, self.weight, self.bias)
 
-        # 解密：添加 rW
+        # 解密：减去 rW
         if sec.decrypt_on_cpu:
             # 将 y' 回传到 CPU，在 CPU 上做补偿，再返回设备
             y_cpu = y_masked.detach().to(device="cpu", dtype=torch.float32)
             rw = rw_cpu.to(dtype=y_cpu.dtype)
             if y_cpu.dim() == 2:
-                y_cpu = y_cpu + rw.unsqueeze(0)
+                y_cpu = y_cpu - rw.unsqueeze(0)
             else:
                 view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
-                y_cpu = y_cpu + rw.view(*view_shape)
+                y_cpu = y_cpu - rw.view(*view_shape)
             # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
             y = y_cpu.to(dtype=y_masked.dtype) if sec.tee_strict_mode and sec.encrypt_on_cpu else y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
             if y_masked.dim() == 2:
-                y = y_masked + rw.unsqueeze(0)
+                y = y_masked - rw.unsqueeze(0)
             else:
                 view_shape = [1] * (y_masked.dim() - 1) + [rw.shape[0]]
-                y = y_masked + rw.view(*view_shape)
+                y = y_masked - rw.view(*view_shape)
 
         # 严格TEE下，保证QKV线性后的输出在CPU，便于后续CPU模块（RMSNorm/Rotary等）
         if sec.tee_strict_mode:
