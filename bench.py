@@ -2,7 +2,7 @@ import os
 import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
+from nanovllm.utils.secure import set_security_config
 
 
 def main():
@@ -12,12 +12,22 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+
+    set_security_config(
+        enable_softmax_encrypt=False,
+        enable_linear_noise=False,
+        encrypt_on_cpu=False,
+        decrypt_on_cpu=False,
+        tee_strict_mode=False,
+        noise_pool_size=16,
+        noise_scale=0.05,
+        seed=1234,
+    )
+    llm = LLM(path, enforce_eager=True, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()

@@ -8,13 +8,12 @@ def main():
     t0 = time.perf_counter()
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    # 启用加密方案：CPU 作为 TEE，GPU 作为不可信加速器
     set_security_config(
-        enable_softmax_encrypt=False,   # Q/K 正交加密
-        enable_linear_noise=False,      # QKV 线性层输入侧加噪 + rW 预计算
-        encrypt_on_cpu=False,           # 在 CPU执行加密
-        decrypt_on_cpu=False,           # 在 CPU执行解密
-        tee_strict_mode=False,          # 严格 TEE 模式，尽量在 CPU 上执行非加密计算
+        enable_softmax_encrypt=True,
+        enable_linear_noise=True,
+        encrypt_on_cpu=True,
+        decrypt_on_cpu=True,
+        tee_strict_mode=True,
         noise_pool_size=16,
         noise_scale=0.05,
         seed=1234,

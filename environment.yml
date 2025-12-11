@@ -1,0 +1,7 @@
+name: llm
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch-cuda=12.1
+prefix: /home/xuzihuan/miniconda3/envs/llm

@@ -5,6 +5,8 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.utils.nvtx import nvtx_range
+
 
 # Triton JIT 编译的 kernel，用于将 key/value 写入 KV Cache
 @triton.jit
@@ -39,7 +41,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     # 启动 Triton kernel
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    with nvtx_range("attention::store_kvcache"):
+        store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 # 注意力层实现，支持 KV Cache 和 FlashAttention
 class Attention(nn.Module):
@@ -69,12 +72,28 @@ class Attention(nn.Module):
             if context.block_tables is not None:    # 如果有 prefix cache，直接用 cache
                 k, v = k_cache, v_cache
             # 调用 FlashAttention 变长实现，支持高效批量推理
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            with nvtx_range("attention::flash_prefill"):
+                o = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q=context.max_seqlen_q,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_k=context.max_seqlen_k,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    block_table=context.block_tables,
+                )
         else:    # decode 阶段，单步生成，直接用 KV Cache
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            with nvtx_range("attention::flash_decode"):
+                o = flash_attn_with_kvcache(
+                    q.unsqueeze(1),
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=context.context_lens,
+                    block_table=context.block_tables,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
         return o  # 返回注意力输出

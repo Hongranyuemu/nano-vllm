@@ -32,6 +32,8 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
+    #计算当前块内的hash，以及把前一个块的hash（prefix）叠加上去
+    #意味着：只有当当前块的内容以及之前所有块的内容都完全一致时，hash值才会相同
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -62,23 +64,29 @@ class BlockManager:
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
+            #1.计算当前块的hash值
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            #2.查看hash表中是否存在该hash值
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:
+                #如果没找的，或者是新的未满块 -> 分配新的块（共享块只能是不可变/只读的，不然会影响其他引用该块的序列）
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
+                #3.命中缓存！（cache hit）
+                #复用这个block_id，不分配新的块
                 seq.num_cached_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
-                    block.ref_count += 1
+                    block.ref_count += 1 #该块的饮用计数 +1
                 else:
                     block = self._allocate_block(block_id)
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
+            # 4. 把块id填入当前句子的块表中
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):

@@ -119,13 +119,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         # 调用父类初始化（列并行，内部会按 TP 分片输出尺寸）
         super().__init__(hidden_size, output_size, bias)
 
+        sec = get_security_config()
         # 掩码/噪声配置
-        self.enable_mask = enable_mask
+        self.enable_mask = enable_mask and sec.tee_strict_mode
         self.mask_scale = mask_scale
         self.hidden_size = hidden_size
         self.layer_id = layer_id
 
-        sec = get_security_config()
         self.decrypt_on_cpu = sec.decrypt_on_cpu
         pool_size = sec.noise_pool_size
         # 噪声池（输入维度：hidden_size，输出维度：本层的 out_features）
@@ -164,6 +164,8 @@ class QKVParallelLinear(ColumnParallelLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 安全配置
         sec = get_security_config()
+        cpu_encrypt = sec.encrypt_on_cpu and sec.tee_strict_mode
+        cpu_decrypt = sec.decrypt_on_cpu and sec.tee_strict_mode
         # 未启用掩码/噪声：仍需保证设备一致，并在严格TEE下将输出移回CPU
         if not self.enable_mask or self._noise_pool is None:
             if x.device != self.weight.device:
@@ -177,7 +179,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         r_cpu, rw_cpu, _ = self._noise_pool.sample()
 
         # 在 CPU 进行加密（TEE）：x' = x + r
-        if sec.encrypt_on_cpu:
+        if cpu_encrypt:
             x_cpu = x.detach().to(device="cpu", dtype=torch.float32)
             r = r_cpu.to(dtype=x_cpu.dtype)
             if x_cpu.dim() == 2:
@@ -202,7 +204,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         y_masked = F.linear(x_masked, self.weight, self.bias)
 
         # 解密：减去 rW
-        if sec.decrypt_on_cpu:
+        if cpu_decrypt:
             # 将 y' 回传到 CPU，在 CPU 上做补偿，再返回设备
             y_cpu = y_masked.detach().to(device="cpu", dtype=torch.float32)
             rw = rw_cpu.to(dtype=y_cpu.dtype)
@@ -212,7 +214,10 @@ class QKVParallelLinear(ColumnParallelLinear):
                 view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
                 y_cpu = y_cpu - rw.view(*view_shape)
             # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
-            y = y_cpu.to(dtype=y_masked.dtype) if sec.tee_strict_mode and sec.encrypt_on_cpu else y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
+            if sec.tee_strict_mode:
+                y = y_cpu.to(dtype=y_masked.dtype)
+            else:
+                y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
