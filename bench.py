@@ -10,6 +10,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Nano-VLLM benchmark harness")
     parser.add_argument("--fixed_gen_tokens", type=int, default=256, help="Number of tokens each request must generate.")
     parser.add_argument("--batch-size", type=int, default=256, help="Number of prompts/sequences per run.")
+    parser.add_argument("--dist-url", type=str, default=None, help="Custom torch.distributed rendezvous URL.")
+    parser.add_argument("--dist-port", type=int, default=None, help="Only override TCP port for rendezvous (host=127.0.0.1).")
     return parser.parse_args()
 
 
@@ -36,7 +38,14 @@ def main():
         noise_scale=0.05,
         seed=1234,
     )
-    llm = LLM(path, enforce_eager=True, max_model_len=4096)
+    llm_kwargs = {"enforce_eager": True, "max_model_len": 4096}
+    if args.dist_url and args.dist_port:
+        raise ValueError("Specify either --dist-url or --dist-port, not both.")
+    if args.dist_url:
+        llm_kwargs["dist_url"] = args.dist_url
+    elif args.dist_port:
+        llm_kwargs["dist_url"] = f"tcp://127.0.0.1:{args.dist_port}"
+    llm = LLM(path, **llm_kwargs)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [
