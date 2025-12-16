@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.utils.nvtx import nvtx_range
 
 
 class LLMEngine:
@@ -70,9 +71,12 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        step_idx = 0
         while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
+            with nvtx_range(f"tee::step_{step_idx}"):
+                t = perf_counter()
+                output, num_tokens = self.step()
+            step_idx += 1
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)

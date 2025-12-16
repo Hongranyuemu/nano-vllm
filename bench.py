@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 from random import randint, seed
@@ -5,7 +6,14 @@ from nanovllm import LLM, SamplingParams
 from nanovllm.utils.secure import set_security_config
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Nano-VLLM benchmark harness")
+    parser.add_argument("--fixed_gen_tokens", type=int, default=256, help="Number of tokens each request must generate.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     seed(0)
     num_seqs = 256
     max_input_len = 1024
@@ -26,10 +34,12 @@ def main():
     llm = LLM(path, enforce_eager=True, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
+    sampling_params = [
+        SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=args.fixed_gen_tokens) for _ in range(num_seqs)
+    ]
 
 
-    llm.generate(["Benchmark: "], SamplingParams())
+    llm.generate(["Benchmark: "], SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=args.fixed_gen_tokens))
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     t = (time.time() - t)
