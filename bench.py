@@ -9,24 +9,29 @@ from nanovllm.utils.secure import set_security_config
 def parse_args():
     parser = argparse.ArgumentParser(description="Nano-VLLM benchmark harness")
     parser.add_argument("--fixed_gen_tokens", type=int, default=256, help="Number of tokens each request must generate.")
+    parser.add_argument("--batch-size", type=int, default=256, help="Number of prompts/sequences per run.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("batch-size must be positive")
     seed(0)
-    num_seqs = 256
+    num_seqs = args.batch_size
     max_input_len = 1024
     max_ouput_len = 1024
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 
+    switch = True
+
     set_security_config(
-        enable_softmax_encrypt=False,
-        enable_linear_noise=False,
-        encrypt_on_cpu=False,
-        decrypt_on_cpu=False,
-        tee_strict_mode=False,
+        enable_softmax_encrypt=switch,
+        enable_linear_noise=switch,
+        encrypt_on_cpu=switch,
+        decrypt_on_cpu=switch,
+        tee_strict_mode=switch,
         noise_pool_size=16,
         noise_scale=0.05,
         seed=1234,
