@@ -10,6 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.nvtx import nvtx_range, nvtx_meta, op_tag
 
 
 class ModelRunner:
@@ -215,11 +216,17 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool, step_id: int | None = None) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        seqlen = max(len(seq) for seq in seqs) if seqs else 0
+        bs = len(seqs)
+        mode = "prefill" if is_prefill else "decode"
+        with nvtx_meta(step_id=step_id, bs=bs, seqlen=seqlen, mode=mode, rank=self.rank):
+            with nvtx_range(op_tag("logits")):
+                logits = self.run_model(input_ids, positions, is_prefill)
+            with nvtx_range(op_tag("sample")):
+                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 

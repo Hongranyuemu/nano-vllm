@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -10,7 +11,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.utils.nvtx import nvtx_range
+from nanovllm.utils.nvtx import nvtx_range, nvtx_step, run_tag
 
 
 class LLMEngine:
@@ -21,6 +22,7 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
+        self._step_id = 0
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
@@ -47,11 +49,18 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        step_id = self._step_id
+        self._step_id += 1
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        bs = len(seqs)
+        seqlen = max(len(seq) for seq in seqs) if seqs else 0  # align on max sequence length in this microbatch
+        mode = "prefill" if is_prefill else "decode"
+        rank = getattr(self.model_runner, "rank", None)
+        with nvtx_step(step_id, bs, seqlen, mode, rank=rank):
+            token_ids = self.model_runner.call("run", seqs, is_prefill, step_id)
+            self.scheduler.postprocess(seqs, token_ids)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
     def is_finished(self):
@@ -63,6 +72,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        self._step_id = 0
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
@@ -71,25 +81,24 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
-        step_idx = 0
-        while not self.is_finished():
-            with nvtx_range(f"tee::step_{step_idx}"):
+        rank = getattr(self.model_runner, "rank", None)
+        with nvtx_range(run_tag(rank=rank)):
+            while not self.is_finished():
                 t = perf_counter()
                 output, num_tokens = self.step()
-            step_idx += 1
-            if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
                 if use_tqdm:
-                    pbar.update(1)
+                    if num_tokens > 0:
+                        prefill_throughput = num_tokens / (perf_counter() - t)
+                    else:
+                        decode_throughput = -num_tokens / (perf_counter() - t)
+                    pbar.set_postfix({
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    })
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    if use_tqdm:
+                        pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:

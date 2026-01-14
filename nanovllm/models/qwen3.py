@@ -9,8 +9,8 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from nanovllm.utils.nvtx import layer_nvtx_name, nvtx_range
 from nanovllm.utils.secure import get_security_config, orthogonal_matrix
+from nanovllm.utils.nvtx import nvtx_range, layer_tag, op_tag
 
 
 class Qwen3Attention(nn.Module):
@@ -26,7 +26,6 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
-
         layer_id: int = 0,
     ) -> None:
         super().__init__()
@@ -46,7 +45,7 @@ class Qwen3Attention(nn.Module):
         # QK^T加密：使用正交矩阵 R，满足 R^{-1} = R^T
         sec = get_security_config()
         self.encrypt_enabled = sec.enable_softmax_encrypt and sec.tee_strict_mode
-        if self.encrypt_enabled:
+        if sec.enable_softmax_encrypt:
             # 使用 float32 存储 R，保持正交性，避免 bf16 破坏 R R^T ≈ I
             R = orthogonal_matrix(self.head_dim, dtype=torch.float32, device=torch.device('cpu'))
         else:
@@ -65,7 +64,7 @@ class Qwen3Attention(nn.Module):
             mask_scale=get_security_config().noise_scale,
             layer_id=layer_id,
         )
-        
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -88,7 +87,7 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # 严格TEE：除QKV线性与注意力核外，其余尽量在CPU上执行
-        if get_security_config().tee_strict_mode:
+        if sec.tee_strict_mode:
             self.q_norm.to("cpu")
             self.k_norm.to("cpu")
             self.o_proj.to("cpu")
@@ -100,26 +99,23 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # 形成 QKV 矩阵（QKV 线性在GPU，解密后可根据配置保留在CPU）
-        with nvtx_range(layer_nvtx_name("tee::qkv_project", self.layer_id)):
+        with nvtx_range(op_tag("qkv")):
             qkv = self.qkv_proj(hidden_states)
-        with nvtx_range(layer_nvtx_name("tee::split_qkv", self.layer_id)):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        with nvtx_range(layer_nvtx_name("tee::q_norm_cpu", self.layer_id)):
+        with nvtx_range(op_tag("norm")):
             q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-        with nvtx_range(layer_nvtx_name("tee::k_norm_cpu", self.layer_id)):
             k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        with nvtx_range(layer_nvtx_name("tee::rotary_cpu", self.layer_id)):
+        with nvtx_range(op_tag("rope")):
             q, k = self.rotary_emb(positions, q, k)
 
         # 应用正交加密（仅将加密后的 q/k 与 v 送到 GPU 做注意力）
         sec = get_security_config()
         if self.encrypt_enabled:
-            use_cpu_encrypt = sec.encrypt_on_cpu and sec.tee_strict_mode
-            encrypt_label = "tee::encrypt_qk_cpu" if use_cpu_encrypt else "tee::encrypt_qk"
-            with nvtx_range(layer_nvtx_name(encrypt_label, self.layer_id)):
-                if use_cpu_encrypt:
+            encrypt_label = op_tag("encrypt_qk_cpu") if sec.encrypt_on_cpu else op_tag("encrypt_qk")
+            with nvtx_range(encrypt_label):
+                if sec.encrypt_on_cpu:
                     R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
                     q = torch.matmul(q.detach().to(device="cpu", dtype=torch.float32), R_cpu)
                     k = torch.matmul(k.detach().to(device="cpu", dtype=torch.float32), R_cpu)
@@ -131,23 +127,26 @@ class Qwen3Attention(nn.Module):
         if sec.tee_strict_mode:
             # 加密后的 q/k/v 先转到 GPU；FlashAttention 需要 bf16/fp16。
             target_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-            with nvtx_range(layer_nvtx_name("tee::cpu_to_cuda_qkv", self.layer_id)):
+            with nvtx_range(op_tag("cpu_to_cuda_qkv")):
                 q_gpu = q.to(device="cuda", dtype=target_dtype)
                 k_gpu = k.to(device="cuda", dtype=target_dtype)
                 v_gpu = v.to(device="cuda", dtype=target_dtype)
             # 在 GPU 上计算注意力（包含 s = softmax(QK^T) 和 s @ V）
-            o_gpu = self.attn(q_gpu, k_gpu, v_gpu)
+            with nvtx_range(op_tag("attn_out")):
+                o_gpu = self.attn(q_gpu, k_gpu, v_gpu)
             # 将注意力输出带回 CPU，后续输出投影在 CPU 进行
-            with nvtx_range(layer_nvtx_name("tee::cuda_to_cpu_attn", self.layer_id)):
+            with nvtx_range(op_tag("cuda_to_cpu_attn")):
                 o_cpu = o_gpu.to(device="cpu", dtype=o_gpu.dtype)
-            with nvtx_range(layer_nvtx_name("tee::o_proj_cpu", self.layer_id)):
+            with nvtx_range(op_tag("o_proj_cpu")):
                 output = self.o_proj(o_cpu.flatten(1, -1))
             return output
         else:
-            o = self.attn(q, k, v)
-            with nvtx_range(layer_nvtx_name("tee::o_proj_gpu", self.layer_id)):
+            with nvtx_range(op_tag("attn_out")):
+                o = self.attn(q, k, v)
+            with nvtx_range(op_tag("o_proj_gpu")):
                 output = self.o_proj(o.flatten(1, -1))
             return output
+
 
 class Qwen3MLP(nn.Module):
 
@@ -219,16 +218,18 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with nvtx_range(layer_nvtx_name("tee::input_layernorm", self.layer_id)):
-            if residual is None:
-                hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        with nvtx_range(layer_nvtx_name("tee::post_attention_layernorm", self.layer_id)):
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        with nvtx_range(layer_nvtx_name("tee::mlp_cpu", self.layer_id)):
-            hidden_states = self.mlp(hidden_states)
+        with nvtx_range(layer_tag(self.layer_id)):
+            with nvtx_range(op_tag("norm")):
+                if residual is None:
+                    hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+                else:
+                    hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            with nvtx_range(op_tag("attn")):
+                hidden_states = self.self_attn(positions, hidden_states)
+            with nvtx_range(op_tag("norm")):
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            with nvtx_range(op_tag("mlp")):
+                hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -257,18 +258,17 @@ class Qwen3Model(nn.Module):
         sec = get_security_config()
         if sec.tee_strict_mode:
             # 输入 ID / 位置编码先迁移到可信 CPU，保证嵌入阶段不触碰 GPU
-            with nvtx_range("tee::embed_inputs_to_cpu"):
+            with nvtx_range(op_tag("embed_inputs_to_cpu")):
                 input_ids = input_ids.to("cpu")
                 positions = positions.to("cpu")
-        embed_label = "tee::embed_tokens_cpu" if sec.tee_strict_mode else "embed_tokens"
+        embed_label = op_tag("embed_tokens_cpu") if sec.tee_strict_mode else op_tag("embed_tokens")
         with nvtx_range(embed_label):
             hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for idx, layer in enumerate(self.layers):
-            range_name = f"tee::decoder_layer_{idx}"
-            with nvtx_range(range_name):
+        for layer in self.layers:
+            with nvtx_range(layer_tag(layer.layer_id)):
                 hidden_states, residual = layer(positions, hidden_states, residual)
-        with nvtx_range("tee::final_norm"):
+        with nvtx_range(op_tag("final_norm")):
             hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -306,5 +306,5 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        with nvtx_range("tee::lm_head"):
+        with nvtx_range(op_tag("lm_head")):
             return self.lm_head(hidden_states)
