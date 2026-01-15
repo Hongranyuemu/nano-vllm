@@ -22,8 +22,7 @@ def main():
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
-        "介绍自己",
-        "计算1到100的数字求和",
+        "introduce yourself",
     ]
     prompts = [
         tokenizer.apply_chat_template(

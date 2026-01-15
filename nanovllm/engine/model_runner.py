@@ -10,7 +10,6 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.nvtx import nvtx_range, nvtx_meta, op_tag
 
 
 class ModelRunner:
@@ -24,6 +23,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        #torch相关初始化
         dist.init_process_group("nccl", self.config.dist_url, world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -35,11 +35,15 @@ class ModelRunner:
             runtime_dtype = default_dtype
         torch.set_default_dtype(runtime_dtype)
         torch.set_default_device("cuda")
+
+        #模型相关初始化
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -199,7 +203,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        #根据是否启用 cudagraph 和输入长度决定执行路径
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+
+            #直接调用模型的 forward 函数
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -217,16 +224,19 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool, step_id: int | None = None) -> list[int]:
+        #准备输入张量
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+
+        #在tp > 0的时候，只有主进程（rank=0)的时候才需要构造温度对象。因为温度属于forward完成后的后处理流程中才需要用的
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        seqlen = max(len(seq) for seq in seqs) if seqs else 0
-        bs = len(seqs)
-        mode = "prefill" if is_prefill else "decode"
-        with nvtx_meta(step_id=step_id, bs=bs, seqlen=seqlen, mode=mode, rank=self.rank):
-            with nvtx_range(op_tag("logits")):
-                logits = self.run_model(input_ids, positions, is_prefill)
-            with nvtx_range(op_tag("sample")):
-                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+        #调用run_model函数，即执行一次模型的forward（前向传播），生成logits
+        logits = self.run_model(input_ids, positions, is_prefill)
+
+        #传入温度对象，调用采样器对logits进行采样，采样的目的是让输出能够更多样化
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+        #重置上下文，然后返回token_id
         reset_context()
         return token_ids
 

@@ -10,7 +10,6 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.secure import get_security_config, orthogonal_matrix
-from nanovllm.utils.nvtx import nvtx_range, layer_tag, op_tag
 
 
 class Qwen3Attention(nn.Module):
@@ -99,53 +98,42 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # 形成 QKV 矩阵（QKV 线性在GPU，解密后可根据配置保留在CPU）
-        with nvtx_range(op_tag("qkv")):
-            qkv = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        with nvtx_range(op_tag("norm")):
-            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
-            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
+        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        with nvtx_range(op_tag("rope")):
-            q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k)
 
         # 应用正交加密（仅将加密后的 q/k 与 v 送到 GPU 做注意力）
         sec = get_security_config()
         if self.encrypt_enabled:
-            encrypt_label = op_tag("encrypt_qk_cpu") if sec.encrypt_on_cpu else op_tag("encrypt_qk")
-            with nvtx_range(encrypt_label):
-                if sec.encrypt_on_cpu:
-                    R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
-                    q = torch.matmul(q.detach().to(device="cpu", dtype=torch.float32), R_cpu)
-                    k = torch.matmul(k.detach().to(device="cpu", dtype=torch.float32), R_cpu)
-                else:
-                    R = self.encrypt_R.to(device=q.device, dtype=q.dtype)
-                    q = torch.matmul(q, R)
-                    k = torch.matmul(k, R)
+            if sec.encrypt_on_cpu:
+                R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
+                q = torch.matmul(q.detach().to(device="cpu", dtype=torch.float32), R_cpu)
+                k = torch.matmul(k.detach().to(device="cpu", dtype=torch.float32), R_cpu)
+            else:
+                R = self.encrypt_R.to(device=q.device, dtype=q.dtype)
+                q = torch.matmul(q, R)
+                k = torch.matmul(k, R)
 
         if sec.tee_strict_mode:
             # 加密后的 q/k/v 先转到 GPU；FlashAttention 需要 bf16/fp16。
             target_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-            with nvtx_range(op_tag("cpu_to_cuda_qkv")):
-                q_gpu = q.to(device="cuda", dtype=target_dtype)
-                k_gpu = k.to(device="cuda", dtype=target_dtype)
-                v_gpu = v.to(device="cuda", dtype=target_dtype)
+            q_gpu = q.to(device="cuda", dtype=target_dtype)
+            k_gpu = k.to(device="cuda", dtype=target_dtype)
+            v_gpu = v.to(device="cuda", dtype=target_dtype)
             # 在 GPU 上计算注意力（包含 s = softmax(QK^T) 和 s @ V）
-            with nvtx_range(op_tag("attn_out")):
-                o_gpu = self.attn(q_gpu, k_gpu, v_gpu)
+            o_gpu = self.attn(q_gpu, k_gpu, v_gpu)
             # 将注意力输出带回 CPU，后续输出投影在 CPU 进行
-            with nvtx_range(op_tag("cuda_to_cpu_attn")):
-                o_cpu = o_gpu.to(device="cpu", dtype=o_gpu.dtype)
-            with nvtx_range(op_tag("o_proj_cpu")):
-                output = self.o_proj(o_cpu.flatten(1, -1))
+            o_cpu = o_gpu.to(device="cpu", dtype=o_gpu.dtype)
+            output = self.o_proj(o_cpu.flatten(1, -1))
             return output
-        else:
-            with nvtx_range(op_tag("attn_out")):
-                o = self.attn(q, k, v)
-            with nvtx_range(op_tag("o_proj_gpu")):
-                output = self.o_proj(o.flatten(1, -1))
-            return output
+
+        o = self.attn(q, k, v)
+        output = self.o_proj(o.flatten(1, -1))
+        return output
 
 
 class Qwen3MLP(nn.Module):
@@ -218,18 +206,13 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with nvtx_range(layer_tag(self.layer_id)):
-            with nvtx_range(op_tag("norm")):
-                if residual is None:
-                    hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-                else:
-                    hidden_states, residual = self.input_layernorm(hidden_states, residual)
-            with nvtx_range(op_tag("attn")):
-                hidden_states = self.self_attn(positions, hidden_states)
-            with nvtx_range(op_tag("norm")):
-                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-            with nvtx_range(op_tag("mlp")):
-                hidden_states = self.mlp(hidden_states)
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -258,18 +241,13 @@ class Qwen3Model(nn.Module):
         sec = get_security_config()
         if sec.tee_strict_mode:
             # 输入 ID / 位置编码先迁移到可信 CPU，保证嵌入阶段不触碰 GPU
-            with nvtx_range(op_tag("embed_inputs_to_cpu")):
-                input_ids = input_ids.to("cpu")
-                positions = positions.to("cpu")
-        embed_label = op_tag("embed_tokens_cpu") if sec.tee_strict_mode else op_tag("embed_tokens")
-        with nvtx_range(embed_label):
-            hidden_states = self.embed_tokens(input_ids)
+            input_ids = input_ids.to("cpu")
+            positions = positions.to("cpu")
+        hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
-            with nvtx_range(layer_tag(layer.layer_id)):
-                hidden_states, residual = layer(positions, hidden_states, residual)
-        with nvtx_range(op_tag("final_norm")):
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -306,5 +284,4 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        with nvtx_range(op_tag("lm_head")):
-            return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states)
