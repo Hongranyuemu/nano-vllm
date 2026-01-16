@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from nanovllm.utils.secure import NoisePool, get_security_config
 
+import torch.cuda.nvtx as nvtx
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -175,21 +177,24 @@ class QKVParallelLinear(ColumnParallelLinear):
                 y = y.to(device="cpu", dtype=y.dtype)
             return y
 
-        # 采样噪声 r 及补偿 rW（均为 CPU 张量，形状：[in_features], [out_features]）
-        r_cpu, rw_cpu, _ = self._noise_pool.sample()
+        with nvtx.range("Sample_Noise(CPU)"):
+            # 采样噪声 r 及补偿 rW（均为 CPU 张量，形状：[in_features], [out_features]）
+            r_cpu, rw_cpu, _ = self._noise_pool.sample()
 
         # 在 CPU 进行加密（TEE）：x' = x + r
         if cpu_encrypt:
-            x_cpu = x.detach().to(device="cpu", dtype=torch.float32)
-            r = r_cpu.to(dtype=x_cpu.dtype)
-            if x_cpu.dim() == 2:
-                r_b = r.unsqueeze(0)
-            else:
-                view_shape = [1] * (x_cpu.dim() - 1) + [r.shape[0]]
-                r_b = r.view(*view_shape)
-            x_masked_cpu = x_cpu + r_b
+            with nvtx.range("Encrypt_Linear(CPU)"):
+                x_cpu = x.detach().to(device="cpu", dtype=torch.float32)
+                r = r_cpu.to(dtype=x_cpu.dtype)
+                if x_cpu.dim() == 2:
+                    r_b = r.unsqueeze(0)
+                else:
+                    view_shape = [1] * (x_cpu.dim() - 1) + [r.shape[0]]
+                    r_b = r.view(*view_shape)
+                x_masked_cpu = x_cpu + r_b
             # 传送给不安全 GPU 做线性
-            x_masked = x_masked_cpu.to(device=self.weight.device, dtype=x.dtype)
+            with nvtx.range("Data_H2D"):
+                x_masked = x_masked_cpu.to(device=self.weight.device, dtype=x.dtype)
         else:
             # 在当前设备直接加密（不安全环境），仅用于测试或性能对比
             r = r_cpu.to(device=x.device, dtype=x.dtype)
@@ -200,24 +205,29 @@ class QKVParallelLinear(ColumnParallelLinear):
                 r_b = r.view(*view_shape)
             x_masked = x + r_b
 
+        with nvtx.range("Generate_QKV(GPU)"):
         # 在 GPU 上计算加密后的线性：y' = (x + r) W^T + b
-        y_masked = F.linear(x_masked, self.weight, self.bias)
+            y_masked = F.linear(x_masked, self.weight, self.bias)
 
+        
         # 解密：减去 rW
         if cpu_decrypt:
+            with nvtx.range("Data_D2H"):
             # 将 y' 回传到 CPU，在 CPU 上做补偿，再返回设备
-            y_cpu = y_masked.detach().to(device="cpu", dtype=torch.float32)
-            rw = rw_cpu.to(dtype=y_cpu.dtype)
-            if y_cpu.dim() == 2:
-                y_cpu = y_cpu - rw.unsqueeze(0)
-            else:
-                view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
-                y_cpu = y_cpu - rw.view(*view_shape)
-            # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
-            if sec.tee_strict_mode:
-                y = y_cpu.to(dtype=y_masked.dtype)
-            else:
-                y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
+                y_cpu = y_masked.detach().to(device="cpu", dtype=torch.float32)
+            
+            with nvtx.range("Decrypt_Linear(CPU)"):
+                rw = rw_cpu.to(dtype=y_cpu.dtype)
+                if y_cpu.dim() == 2:
+                    y_cpu = y_cpu - rw.unsqueeze(0)
+                else:
+                    view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
+                    y_cpu = y_cpu - rw.view(*view_shape)
+                # 严格TEE：QKV线性(GPU)外的后续计算尽量在CPU进行
+                if sec.tee_strict_mode:
+                    y = y_cpu.to(dtype=y_masked.dtype)
+                else:
+                    y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)

@@ -12,6 +12,8 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+import torch.cuda.nvtx as nvtx
+
 
 class LLMEngine:
     #解析配置、启动若干个并行的 worker 进程（用于张量并行 TP）、在主进程创建 0 号 worker、加载 tokenizer、初始化调度器，并注册退出时的清理函数。
@@ -54,33 +56,38 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        #如果是字符串提示，则先用 tokenizer 编码成 token ID 列表
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+        with nvtx.range("AddRequest"):
+            #如果是字符串提示，则先用 tokenizer 编码成 token ID 列表
+            if isinstance(prompt, str):
+                prompt = self.tokenizer.encode(prompt)
 
-        #创建一个 Sequence 对象并添加到调度器中
-        seq = Sequence(prompt, sampling_params)
+            #创建一个 Sequence 对象并添加到调度器中
+            seq = Sequence(prompt, sampling_params)
 
-        #将请求添加到调度器
-        self.scheduler.add(seq)
+            #将请求添加到调度器
+            self.scheduler.add(seq)
 
     def step(self):
         step_id = self._step_id
         self._step_id += 1
 
-        #区分prefill和decode阶段，获取当前需要处理的序列列表和是否是prefill阶段
-        seqs, is_prefill = self.scheduler.schedule()
+        with nvtx.range(f"Step_{step_id}"):
+            with nvtx.range("Scheduler"):
+                #区分prefill和decode阶段，获取当前需要处理的序列列表和是否是prefill阶段
+                seqs, is_prefill = self.scheduler.schedule()
 
-        #调用 model_runner 进行推理，获取新生成的 token IDs
-        token_ids = self.model_runner.call("run", seqs, is_prefill, step_id)
+            with nvtx.range("ModelRunner"):
+                #调用 model_runner 进行推理，获取新生成的 token IDs
+                token_ids = self.model_runner.call("run", seqs, is_prefill, step_id)
 
-        #把 token 写回请求对象里，检查stop条件，更新seq状态，并决定是否结束
-        self.scheduler.postprocess(seqs, token_ids)
+            with nvtx.range("Postprocess"):
+                #把 token 写回请求对象里，检查stop条件，更新seq状态，并决定是否结束
+                self.scheduler.postprocess(seqs, token_ids)
 
-        #收集本轮已经完成的输出
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+            #收集本轮已经完成的输出
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+            return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -126,10 +133,11 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
 
-        #按 seq_id 从小到大，把结果整理成一个 list
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        #将 token IDs 解码成文本
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        if use_tqdm:
-            pbar.close()
-        return outputs
+        with nvtx.range("Generate_Finish"):
+            #按 seq_id 从小到大，把结果整理成一个 list
+            outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+            #将 token IDs 解码成文本
+            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+            if use_tqdm:
+                pbar.close()
+            return outputs

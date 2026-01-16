@@ -11,6 +11,8 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+from nanovllm.utils.secure import get_security_config  
+import torch.cuda.nvtx as nvtx
 
 class ModelRunner:
 
@@ -100,13 +102,14 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
+        with nvtx.range("WarmupModel"):
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
+            num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+            seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+            self.run(seqs, True)
+            torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -168,8 +171,12 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        #加密情况下，input_ids 和 positions 放在 CPU 上，不需要传给GPU，后面的decode和sample也是一样
+        device = "cpu" if get_security_config().tee_strict_mode else "cuda"
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(device=device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(device=device, non_blocking=True)
+
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -186,8 +193,11 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+
+        device = "cpu" if get_security_config().tee_strict_mode else "cuda"
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).to(device=device, non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(device=device, non_blocking=True)
+
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
@@ -198,7 +208,9 @@ class ModelRunner:
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        device = "cpu" if get_security_config().tee_strict_mode else "cuda"
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).to(device=device, non_blocking=True)
+
         return temperatures
 
     @torch.inference_mode()
@@ -224,21 +236,23 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool, step_id: int | None = None) -> list[int]:
-        #准备输入张量
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        tag = "Phase_Prefill" if is_prefill else "Phase_Decode"
+        with nvtx.range(tag):
+            #准备输入张量
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
 
-        #在tp > 0的时候，只有主进程（rank=0)的时候才需要构造温度对象。因为温度属于forward完成后的后处理流程中才需要用的
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            #在tp > 0的时候，只有主进程（rank=0)的时候才需要构造温度对象。因为温度属于forward完成后的后处理流程中才需要用的
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
-        #调用run_model函数，即执行一次模型的forward（前向传播），生成logits
-        logits = self.run_model(input_ids, positions, is_prefill)
+            #调用run_model函数，即执行一次模型的forward（前向传播），生成logits
+            logits = self.run_model(input_ids, positions, is_prefill)
 
-        #传入温度对象，调用采样器对logits进行采样，采样的目的是让输出能够更多样化
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            #传入温度对象，调用采样器对logits进行采样，采样的目的是让输出能够更多样化
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
-        #重置上下文，然后返回token_id
-        reset_context()
-        return token_ids
+            #重置上下文，然后返回token_id
+            reset_context()
+            return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
